@@ -1,0 +1,485 @@
+---
+description: Tauri
+globs: "**/src-tauri/**,**/tauri.conf.json"
+alwaysApply: false
+version: '1.9'
+---
+
+Правило встановлює канонічні вимоги для Tauri-проєктів: виявлення маркерів у монорепо, VS Code-розширення, налаштування mutation-testing для platform bridge, компіляційну ізоляцію agent/LLM-логіки від app-shell, реалізацію Tool Surface поверх Tauri+Rust, реліз-flow через change-файли (тег → DMG/updater-артефакти), автооновлення через спільний `useUpdater()` з `@7n/tauri-components` та верифікацію застосунку LLM-агентом через `tauri-plugin-mcp-bridge`.
+
+## Верифікація LLM-агентом через MCP-міст (замість скриншотів)
+
+Якщо над Tauri-застосунком працює LLM-агент (Claude Code, Cursor тощо), він
+верифікує зміни **програмно** — деревом доступності DOM, кліками за `ref`,
+прямими викликами Rust-команд — а не лише скриншотами. Це забезпечує
+`tauri-plugin-mcp-bridge`: debug-плагін, що піднімає WS-сервер моста
+всередині застосунку, до якого зовні підключається MCP-сервер tauri.
+(Не плутати з **Tool Surface** — `tool-surface.mdc`: той про production
+call surface для UI/оркестратора/LLM, цей — про dev-time верифікацію
+запущеного застосунку.)
+
+### Dev-setup
+
+`src-tauri/Cargo.toml`:
+
+```toml
+[dependencies]
+tauri-plugin-mcp-bridge = "0.11"
+```
+
+Реєстрація плагіна — **лише в debug-збірці** (у release-збірці моста немає):
+
+```rust
+let builder = tauri::Builder::default();
+#[cfg(debug_assertions)]
+let builder = builder.plugin(tauri_plugin_mcp_bridge::init());
+```
+
+WS-сервер моста слухає `0.0.0.0:9223`.
+
+`tauri.conf.json` → `app.withGlobalTauri: true` — **обовʼязково**:
+
+```json title="src-tauri/tauri.conf.json"
+{
+  "app": {
+    "withGlobalTauri": true
+  }
+}
+```
+
+Без `withGlobalTauri` fallback-канал `execute_js` не має як повернути результат — будь-який
+async-скрипт (з `await`/`.then(`/`Promise.`, див. евристику нижче) впаде через
+5с у `Script execution timeout`. `withGlobalTauri` відкриває Tauri API всьому
+JS у webview — прийнятно, бо capabilities однаково обмежують surface;
+проєкти зі стороннім/untrusted контентом у webview мають зважити це окремо.
+
+### Цикл верифікації
+
+Замість скриншотів — послідовність MCP-викликів:
+
+1. `driver_session start` — підключення до моста вже запущеного застосунку (`tauri dev`).
+2. `webview_dom_snapshot type=accessibility` — YAML-дерево з `ref=eN` для кожного елемента.
+3. `webview_interact` — клік/ввід за `ref` з кроку 2.
+4. `webview_execute_js` з `await window.__TAURI__.core.invoke('<команда>', {…})` —
+   пряма звірка бекенд-стану повз UI (Rust-команда, не рендер).
+5. `read_logs source=console` — перевірка консольних помилок/попереджень.
+
+Скриншот — лише щоб показати результат людині, не джерело правди для агента:
+native-скриншот моста не відображає portal-оверлеї (нижче).
+
+### Відомі обмеження моста 0.11.x
+
+- **`ipc_execute_command` не реалізований** — WS-сервер моста дозволяє лише
+  внутрішні команди `plugin:mcp-bridge|*`. Виклик команд застосунку — тільки
+  через `webview_execute_js` + `invoke`, не напряму через `ipc_execute_command`.
+- **`ipc_monitor` перехоплює лише виклики через глобал `window.__TAURI__`.**
+  Стандартний `import { invoke } from '@tauri-apps/api/core'` іде через
+  `__TAURI_INTERNALS__` і в перехоплення не потрапляє.
+- **Евристика native-eval відкидає async-скрипти** — за підрядками `await`,
+  `.then(`, `Promise.` скрипт іде у fallback-канал `execute_js`; без
+  `withGlobalTauri` (вище) fallback не має як повернути результат, і
+  async-скрипт для агента взагалі недоступний.
+- **Native-скриншот не захоплює Quasar/portal-оверлеї** (діалоги, меню) — вони
+  рендеряться поза основним деревом. Перевіряй їх стан через DOM
+  (`document.querySelector('.q-dialog')`), не через скриншот.
+
+Перевірено вживу на проєкті myllm, `tauri-plugin-mcp-bridge` 0.11.2, macOS.
+
+## Mutation-testing: семантика app shell та platform bridge
+
+`tauri` rule володіє Tauri-specific семантикою mutation-testing для каталога `src-tauri/`. Концерн `js/cargo_mutants_config.mjs` без дублювання додає у `<ws>/src-tauri/.cargo/mutants.toml` такі канонічні ключі:
+
+```toml title="<ws>/src-tauri/.cargo/mutants.toml"
+additional_cargo_test_args = ["--lib", "--tests"]
+
+exclude_globs = [
+  "src/main.rs",
+  "src/lib.rs",
+  "src/**/android.rs",
+  "src/**/ios.rs",
+  "src/**/mobile.rs",
+  "src/**/desktop.rs",
+  "src/**/macos.rs",
+  "src/**/windows.rs",
+  "src/**/linux.rs"
+]
+```
+
+Семантика (фіксована між Tauri-проєктами):
+
+- **`src/main.rs`** — binary shell entrypoint: запускає Tauri runtime, реєструє plugins/handlers і повертає управління циклу подій. Тестується smoke/e2e (запуск бінарника), не mutation unit;
+- **`src/lib.rs`** — Tauri runtime entrypoint (`pub fn run`): піднімає весь app shell. Один мутант там тримає весь Tauri runtime, тому ділить sandbox-фейл з `src/main.rs` і тестується smoke/e2e, а не mutation unit;
+- **`*android.rs`, `*ios.rs`, `*mobile.rs`** — mobile plugin bridge / platform glue: тонка обгортка над JNI/Objective-C виклики, mapping platform errors, виклики Tauri AppHandle і native API;
+- **`*macos.rs`, `*windows.rs`, `*linux.rs`, `*desktop.rs`** — desktop platform bridge / OS integration glue: opener/window APIs, OS-specific I/O, mapping platform errors.
+
+Ці файли мають містити **тільки platform boundary**: виклик plugin/native API, Tauri AppHandle, opener/window APIs, OS-specific I/O, mapping platform errors. Якщо у bridge-файлі з'являється pure/business logic — її потрібно винести у platform-neutral модуль (`src/auth/oauth.rs`, `src/gmail/message.rs`, …) і тестувати mutation-testing там.
+
+Це створює фіксовану семантику: `*android.rs`/`*macos.rs` — boundary-файли, а не місце для бізнес-логіки.
+
+### Ідемпотентність і взаємодія з `test`-rule
+
+- `test` rule створює універсальний нейтральний `.cargo/mutants.toml` (порожній з коментарем) для кожного Cargo.toml-manifest-файла — без framework-specific exclude'ів. Це наш baseline.
+- `tauri` rule додає Tauri-канонічні ключі **поверх** того, що вже є у `<ws>/src-tauri/.cargo/mutants.toml`:
+  - якщо файла немає — створює з повного Tauri-baseline;
+  - якщо обидва канонічні ключі (`additional_cargo_test_args`, `exclude_globs`) вже присутні — `manual cargo-mutants config preserved`, нічого не зміниться;
+  - якщо якийсь канонічний ключ відсутній — додається окремим блоком у кінці файла, без зміни існуючих значень.
+- Послідовний `fix test` → `fix tauri` створює Tauri-config; повторний `fix tauri` не дублює секцій; повторний `fix test` не перетирає Tauri-tuning.
+
+## Компіляційний цикл: agent/LLM-логіка окремо від app-shell
+
+Якщо Tauri-застосунок говорить з LLM (agent, tool-calling, chat), agent-логіка **не** живе
+у `src-tauri` разом з app-shell — вона винесена в окремий workspace crate (`agent-core` чи
+подібний), який:
+
+- **не залежить від `tauri`** — інакше будь-який `cargo test -p <crate>` все одно тягне повну
+  збірку Tauri runtime;
+- тестується **без** rebuild застосунку: `cargo test -p agent-core`;
+- має **fake/mock реалізацію LLM-провайдера** для інтеграційних тестів — prompt/tool ітерації
+  перевіряються без мережевого виклику до реального провайдера.
+
+**Чому так:** без розділення кожна ітерація промпта чи tool-виклику коштує повний Tauri
+rebuild (лінковка, bundling, іноді webview) замість секундного `cargo test`.
+
+```
+my-tauri-app/
+├── src-tauri/           ← app-shell: Tauri runtime, window/AppHandle, НЕ містить LLM-залежностей
+│   └── Cargo.toml       ← [workspace] members = [".", "../agent-core"]
+└── agent-core/          ← agent/LLM-логіка: prompt building, tool dispatch, provider abstraction
+    ├── Cargo.toml       ← без залежності на tauri
+    └── tests/
+        └── fake_provider.rs   ← FakeLlmProvider / MockLlmClient — без мережі
+```
+
+Концерн `tauri/core_test_isolation.mjs` (read-only detector, `structural`, авто-фікс ризикований)
+для кожного `src-tauri/Cargo.toml` перевіряє:
+
+1. **LLM-залежність не в app-shell.** Якщо сам `src-tauri/Cargo.toml` має залежність на відомий
+   LLM SDK (напр. `async-openai`, `anthropic`, `ollama-rs`, `rig-core`, ...) — фейл: винеси
+   agent-логіку в окремий crate.
+2. **Окремий crate не тягне tauri.** Якщо у `[workspace] members` є crate з LLM-залежністю, і
+   цей crate сам залежить від `tauri`/`tauri-*` — фейл: `cargo test -p` цього крейту все одно
+   перезбирає Tauri runtime.
+3. **Є fake-провайдер.** Якщо такий crate є і не залежить від tauri, але ніде в його дереві
+   (`**/*.rs`) немає маркера `Fake*Llm`/`Mock*Provider`/`Stub*Client` — фейл: інтеграційні тести
+   на prompt/tool ітерації або мовчки пропускають LLM-логіку, або б'ють по реальному провайдеру.
+
+**Область застосування:** концерн активується лише коли у Tauri-воркспейсі є crate з
+LLM-залежністю — Tauri-проєкти без LLM/agent-логіки не порушують це правило.
+
+**Не автофіксується:** виділення crate, перенесення коду і написання fake-провайдера потребують
+людського розсуду — детектор лише репортує з посиланням на це правило.
+
+## Системні залежності Tauri (Linux) у `lint-rust.yml`
+
+Clippy (`cargo clippy --all-targets --all-features`) компілює весь граф залежностей, включно з build-скриптами `-sys`-крейтів (`webkit2gtk-sys`, `gtk-sys`, `libappindicator-sys`). Ці build-скрипти шукають системні `.pc`-файли через pkg-config, тож на `ubuntu-latest` без dev-пакетів крок Clippy падає ще на збірці залежностей. Rustfmt нічого не компілює — вимога стосується саме Clippy.
+
+Правило активується, якщо хоч у одному workspace-пакеті є `src-tauri/Cargo.toml` (Rust-крейт Tauri, який CI компілює). Тоді `.github/workflows/lint-rust.yml` повинен містити крок встановлення системних залежностей:
+
+```yaml
+- name: Системні залежності Tauri (Linux)
+  run: |
+    sudo apt-get update
+    sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+```
+
+Канонічні пакети (Tauri v2): `libwebkit2gtk-4.1-dev` (WebView), `libayatana-appindicator3-dev` (tray), `librsvg2-dev` (іконки). Перевірка — підмножина: додаткові пакети в `apt-get install` дозволені.
+
+Автофікс (T0): якщо apt-кроку немає — вставляє канонічний блок перед `dtolnay/rust-toolchain@…`; якщо крок є, але бракує пакетів — дописує відсутні в наявний `apt-get install`-рядок.
+
+Існування самого `lint-rust.yml` і решту канону файла перевіряє `rust.lint_rust_yml` (rust.mdc) — тут лише Tauri-специфічний apt-крок. Перевірювана логіка — у `main.mjs`/`fix-linux_deps.mjs` цього концерну.
+
+## Реліз-flow: change-файли → тег → DMG/updater-артефакти
+
+Версія Tauri-застосунку — **єдина**, керується change-файлами за конвенцією `n-changelog.mdc`. Ручні v-теги і ручний bump `version` у `tauri.conf.json`/`package.json` **заборонені**: у CI версію проставляє `npx @7n/rules release`, а release-build синхронізує її з тегу (нижче).
+
+Канон складається з двох workflow-файлів і відповідного `tauri.conf.json`-конфігу; референс — `.github/workflows/{changelog-release,release}.yml` та `src-tauri/tauri.conf.json` чотирьох production Tauri-репо, де цей flow вже впроваджено.
+
+### Change-файл — крок вирішення задачі, а не post-hoc lint-фікс
+
+Change-файл (`<app>/.changes/<ts>.md`) створюється **одразу під час вирішення задачі**, що
+чіпає код Tauri-workspace — той самий момент, що lint і doc-files, а не окремий крок після
+сигналу `changeset-missing` від delta-lint concern `changelog/presence`. Без нього мердж у
+`main` не тригерить `changelog-release.yml` (тригер — `paths: [app/.changes/**]`), і зміна
+осідає в репозиторії без релізу, доки хтось не помітить і не додасть change-файл у коміт окремо.
+
+Команда: `npx @7n/n ch --bump <major|minor|patch> --section <Added|Changed|Fixed|Removed> --message "<опис>"`
+(інтерактивно — `npx @7n/n ch`). Повна модель (база порівняння, формат CHANGELOG,
+post-release-інваріант) — у `n-changelog.mdc` і `release/main.mdc`.
+
+`changelog/presence` лишається gate-запобіжником на випадок, якщо крок пропущено (delta-lint
+у CI/hook), а не первинним механізмом створення change-файлу.
+
+### `changelog-release.yml` — бамп версії з change-файлів
+
+Тригериться на push у `main` за наявності change-файлів і на ручний dispatch:
+
+```yaml title=".github/workflows/changelog-release.yml"
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'app/.changes/**'
+  workflow_dispatch: {}
+
+jobs:
+  release:
+    if: "!startsWith(github.event.head_commit.message, 'release:')"
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Configure git identity + push auth
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+      - run: npx @7n/rules release
+      # якщо HEAD став release:* — прочитати нову версію з app/package.json,
+      # тегнути app@$VER і v$VER, запушити, тоді dispatch release.yml
+```
+
+- `paths: [app/.changes/**]` (шлях підставляється під реальний workspace, де лежить `src-tauri`) — тригер лише на change-файли, не на будь-який push у `main`. **У `<app>/.changes/` має жити tracked `.gitkeep`**: реліз споживає всі change-файли, і без нього glob перестає матчити tracked-файли — ga/workflows (`unmatched-paths-glob`) червоніє.
+- **Push-auth обовʼязковий**: `persist-credentials: false` — ga-канон (і дефолт `checkout@v6`), тож без явного `git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@…"` push із `n-rules release` мовчки відхиляється, а тихий git-раннер маскує причину («git push не вдався після 5 спроб (non-fast-forward?)»).
+- `if: "!startsWith(github.event.head_commit.message, 'release:')"` — страховка від циклу: коміт `release:*` теж матче `paths` (він видаляє change-файли), тому job має пропускати сам себе.
+- `permissions: {contents: write, actions: write}` — `actions: write` потрібен для останнього кроку.
+- Після успішного `npx @7n/rules release` (детектується за `git log -1 --pretty=%s` що починається з `release:`) — тегнути `app@$VER` і `v$VER`, запушити обидва.
+- **Останній крок — явний `gh workflow run release.yml --ref "v$VER"`.** Тег пушиться токеном `GITHUB_TOKEN`, а GitHub не тригерить `on.push.tags` workflow-и для push-подій від `GITHUB_TOKEN` — тому без явного dispatch `release.yml` ніколи не запуститься.
+
+Детальна модель change-файлів (база порівняння, формат CHANGELOG, post-release-інваріант) — у `n-changelog.mdc`; тут лише інтеграція з Tauri release-циклом.
+
+### `release.yml` — build/publish DMG й updater-артефактів
+
+Тригериться на push тегів `v*` **і** на ручний dispatch (для випадку, коли автоматичний тригер не спрацював):
+
+```yaml title=".github/workflows/release.yml"
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.ref }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  build-desktop:
+    permissions:
+      contents: write
+      id-token: write # OIDC для Infisical
+    steps:
+      # ... checkout, потім (rust.mdc вимагає кеш, zizmor фейлить
+      # cache-poisoning у тег-тригереному release — прийнятий ризик приглушуємо inline):
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: aarch64-apple-darwin }
+      - uses: Swatinem/rust-cache@v2 # zizmor: ignore[cache-poisoning]
+      - name: Sync app version from tag
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          # записати VER у src-tauri/tauri.conf.json ПЕРЕД tauri-action
+      - uses: Infisical/secrets-action@v1
+        with: { secret-path: '/apple' }
+      - uses: Infisical/secrets-action@v1
+        with: { secret-path: '/updater' }
+      - uses: tauri-apps/tauri-action@v0
+        with: { projectPath: app, args: '--target aarch64-apple-darwin' }
+```
+
+- **«Sync app version from tag» має йти перед кроком `tauri-apps/tauri-action`** — тег `vX.Y.Z` є єдиним джерелом версії для build-артефактів; `tauri.conf.json#version` у робочому дереві не редагується вручну (він там лишається тим, що востаннє поставив `n-rules release`, і синхронізується цим кроком лише в CI, не в git).
+- Секрети підпису — з Infisical: Apple-сертифікати (`secret-path: /apple`) і `TAURI_SIGNING_PRIVATE_KEY` (`secret-path: /updater`) — обидва потрібні `tauri-apps/tauri-action`, щоб зібрати підписаний DMG з updater-артефактами.
+- **macOS-таргет — завжди `aarch64-apple-darwin`, ніколи `universal-apple-darwin`.** Без умовного галуження за кількістю `[[bin]]` у крейті: lipo-merge крок `tauri-action` зливає між арками лише головний GUI-бінарник, а будь-який додатковий `[[bin]]`-таргет лишається поза `universal-apple-darwin`-директорією — бандлер падає на `Failed to copy binary from ".../universal-apple-darwin/release/<bin>": ... does not exist`. Синхронно звузити `with.targets` кроку `dtolnay/rust-toolchain@…` до `aarch64-apple-darwin` (без `x86_64-apple-darwin`).
+
+### `tauri.conf.json` — updater-артефакти й endpoint
+
+```json title="src-tauri/tauri.conf.json"
+{
+  "bundle": {
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "…",
+      "endpoints": ["https://github.com/<owner>/<repo>/releases/latest/download/latest.json"]
+    }
+  }
+}
+```
+
+- `bundle.createUpdaterArtifacts: true` — без цього `tauri-action` не генерує `.sig`/`latest.json`, і клієнтський `check()` (updater.mdc) ніколи не знаходить оновлення.
+- `plugins.updater.endpoints` вказує на GitHub Releases `latest.json` того самого репозиторію, куди `release.yml` публікує реліз.
+
+## Tool Surface у Tauri (реалізація ядра `tool-surface`)
+
+Це per-stack реалізація правила **`tool-surface`** (`n-tool-surface`) для Tauri+Rust. Контракт (каталог → `dispatch` → UI/оркестратор/LLM, інваріант паритету, конверт) — у тому правилі; тут — як він лягає на Tauri.
+
+**Реальна робота живе в Rust, JS-каталог — тонкий call surface.** Handler тула не містить логіки сам — він **делегує** в native. Одна реалізація в Rust-крейті backs два споживачі:
+
+- **Бінарник** (`src-tauri` як CLI, або окремий crate-bin) — headless-вхід для оркестратора;
+- **Tauri-команда** (`#[tauri::command]`) — той самий крейт-fn, обгорнутий для UI.
+
+**Два транспорти одного каталогу** (`src/tool/transports`):
+
+- **UI (in-app):** `invoke(tool.tauri, input)` → Tauri-команда → крейт. Ключі `input` мапляться 1:1 на аргументи команди (camelCase, напр. `tasksDir`); поля вкладених struct лишаються snake_case (Tauri конвертить лише імена top-level аргументів).
+- **Оркестратор (headless):** `bin/<app>.mjs` спавнить зібраний бінарник (`<bin> <verb> …` per-verb, або уніфікований `<bin> exec '<json>'`), парсить JSON stdout.
+
+**Конверт:** Tauri-команда повертає `Result<T, String>`; адаптер мапить у `{ ok, output }` / `{ ok:false, error }`. Бінарник друкує конверт у stdout, exit ≠ 0 на `ok:false`.
+
+**Єдине джерело схем:** надавай перевагу `schemars`-derive на Rust-param-структурах → бінарник віддає маніфест (`<bin> schema`); або тримай схему в JS-каталозі й валідуй до `invoke`. **Не дублюй** контракт між Rust і JS — лише деривація + спільні тест-вектори.
+
+**LLM-раннер in-app:** chat-loop ходить до OpenAI-сумісного ендпоінта через `tauri-plugin-http` fetch (бо webview-fetch обмежений CSP/capability), а тули виконує через спільний `dispatch` (той самий, що й UI).
+
+### Що перевіряє автоматичний lint (`main.mjs`)
+
+Для кожного Tauri-workspace (маркер — `tauri.conf.json` чи `src-tauri/tauri.conf.json`) детектор збирає slugs плагінів, яких торкається JS/TS/Vue-код у `src/**`: через wrapper-import `@tauri-apps/plugin-<slug>` або прямий `invoke('plugin:<slug>|<command>')`. Для кожного знайденого `<slug>` перевіряються три незалежні умови — будь-яка провалена дає окрему violation:
+
+1. **`tool-surface-plugin-dep-missing`** — `src-tauri/Cargo.toml` не оголошує crate `tauri-plugin-<slug>` у жодній секції `[dependencies]`/`[target.*.dependencies]`.
+2. **`tool-surface-plugin-not-registered`** — `src-tauri/src/lib.rs` ніде не згадує rust-ідентифікатор плагіна (`tauri-plugin-dialog` → `tauri_plugin_dialog`, дефіси заміняються на підкреслення), тобто `builder` його не реєструє.
+3. **`tool-surface-plugin-capability-missing`** — жоден файл `src-tauri/capabilities/*.json` не дає permission `<slug>` чи `<slug>:*`.
+
+Кожна з трьох дір — тихий рантайм-фейл без компіляційної помилки: (1) код не збереться на CI іншого профілю або впаде при оновленні залежностей, (2) `invoke` впаде з "plugin not found", (3) `invoke` впаде permission-denied, видимий лише в `console.error`. Перевірено вживу на проєкті myllm.
+
+## Виявлення проєкту Tauri та VS Code-розширення
+
+Правило активується, якщо хоч у одному workspace-пакеті (корінь або будь-який пакет з `package.json#workspaces`) виявлений маркер Tauri:
+
+- існує каталог `<ws>/src-tauri/`;
+- існує `<ws>/src-tauri/Cargo.toml`;
+- існує `<ws>/src-tauri/tauri.conf.json`;
+- існує `<ws>/tauri.conf.json` (legacy flat-layout);
+- `<ws>/package.json#dependencies` чи `devDependencies` містить ключ з префіксом `@tauri-apps/`.
+
+Виявлення виконує `js/tooling.mjs` через `getMonorepoPackageRootDirs()`. Це дозволяє Tauri-rule працювати у монорепо, де Tauri живе в одному з пакетів (а не в корені), не вимагаючи кореневих маркерів.
+
+### VS Code розширення
+
+У `.vscode/extensions.json` `recommendations` має містити `tauri-apps.tauri-vscode`:
+
+```json title=".vscode/extensions.json"
+{
+  "recommendations": ["tauri-apps.tauri-vscode"]
+}
+```
+
+Розширені Rust-вимоги (`rust-lang.rust-analyzer`, `tamasfe.even-better-toml`, скрипт `lint-rust`, CI `lint-rust.yml`) — у правилі **`rust`** (`n-rust.mdc`). Tauri-проєкт завжди має `src-tauri/Cargo.toml`, тому `rust` активується автоматично разом з `tauri`.
+
+Це також покриває CI/release-build job'и, що збирають Tauri-додаток через `tauri-apps/tauri-action`: будь-який job з кроком `dtolnay/rust-toolchain@…` (лінт, coverage чи release/build — не лише `lint-rust.yml`) повинен мати `Swatinem/rust-cache@v2` одразу після нього, інакше CI щоразу заново качає весь cargo registry. Перевірка й автофікс — concern `rust/toolchain_cache` (rust.mdc), не дублюється тут.
+
+Перевірка `tauri-apps.tauri-vscode` виконується Rego-пакетом `tauri.vscode_extensions` через `conftest` (умовно — лише після підтвердження маркера Tauri).
+
+## Автооновлення: `useUpdater()` з `@7n/tauri-components`
+
+Кожен Tauri-застосунок вмикає автооновлення через **спільний** Vue-хук `useUpdater()` з `@7n/tauri-components/vue` — локальні копії цього хука (власна реалізація перевірки/встановлення оновлень) **заборонені**. Джерело канону — `@7n/tauri-components` `npm/src/vue/use-updater.js` і його виклики у чотирьох production Tauri-репо.
+
+### Що робить `useUpdater()`
+
+- **No-op у dev-збірці** (`import.meta.env.DEV`): версія в `tauri.conf.json` — та, що востаннє проставив CI-реліз, а не те, що реально запущено локально, тому dev-збірка завжди вважала б себе застарілою. Це поведінка хука, не місце для локальних обходів.
+- Перша перевірка — через 3 секунди після монтування (`onMounted`), далі — щогодини (`setInterval`).
+- Якщо знайдено оновлення — показує діалог, після згоди завантажує й встановлює, тоді пропонує `relaunch()` (з `@tauri-apps/plugin-process`).
+- Помилки `check()` (мережа, відсутній permission) лише йдуть у `console.error` — без діалогу, щоб не турбувати користувача на кожній мережевій помилці.
+
+### Вимоги до застосунку
+
+Кореневий Vue-компонент (`App.vue`) імпортує й викликає хук без аргументів:
+
+```vue title="src/App.vue"
+<script setup>
+import { useUpdater } from '@7n/tauri-components/vue'
+
+useUpdater()
+</script>
+```
+
+`package.json`:
+
+```json title="package.json"
+{
+  "dependencies": {
+    "@7n/tauri-components": "^0.8.0",
+    "@tauri-apps/plugin-updater": "^2",
+    "@tauri-apps/plugin-process": "^2"
+  }
+}
+```
+
+`src-tauri/Cargo.toml` — `tauri-plugin-updater` реєструється лише для desktop-таргетів (мобільний плагін не існує), `tauri-plugin-process` — безумовно:
+
+```toml title="src-tauri/Cargo.toml"
+[dependencies]
+tauri-plugin-process = "2.3.1"
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-updater = "2"
+```
+
+`src-tauri/src/lib.rs` — реєстрація плагінів дзеркалить ту саму platform-межу: `tauri-plugin-updater` під `#[cfg(desktop)]`, `tauri-plugin-process` — без cfg-guard (потрібен на будь-якій платформі для `relaunch()`):
+
+```rust title="src-tauri/src/lib.rs"
+#[cfg(desktop)]
+let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+
+let builder = builder.plugin(tauri_plugin_process::init());
+```
+
+### Capability: без `updater:default` — тихий фейл
+
+`capabilities/*.json` має надавати `updater:default` і `process:allow-restart`. Обидва permission можна класти прямо в `default.json` (як у застосунках без мобільних таргетів), але якщо в проєкті є мобільні capability-файли — `updater:default` винось в **окремий** capability, обмежений `platforms`, щоб мобільна збірка не тягла desktop-only permission:
+
+```json title="src-tauri/capabilities/updater.json"
+{
+  "identifier": "updater",
+  "windows": ["main"],
+  "platforms": ["macOS", "windows", "linux"],
+  "permissions": ["updater:default"]
+}
+```
+
+```json title="src-tauri/capabilities/default.json"
+{
+  "identifier": "default",
+  "windows": ["main"],
+  "permissions": ["core:default", "process:allow-restart"]
+}
+```
+
+**Без `updater:default` `check()` падає мовчазним permission-denied** — жодного діалогу, жодної помітної помилки користувачу, лише рядок у `console.error`. Це найнебезпечніший режим відмови автооновлення: застосунок виглядає робочим, але жоден користувач ніколи не отримає наступний реліз. Перевіряй `capabilities/*.json` явно після кожної зміни.
+
+### Quasar `Dialog` plugin — друга тиха відмова
+
+`useUpdater()` показує знайдене оновлення через `$q.dialog(...)` (`useQuasar()` з `quasar`). Це вимагає підключеного Quasar-плагіна **`Dialog`** у `src/main.{js,ts}`:
+
+```js title="src/main.js"
+import { Quasar, Dialog, Notify } from 'quasar'
+
+createApp(App).use(Quasar, {
+  plugins: { Dialog, Notify }
+})
+```
+
+**Без `Dialog` у `plugins: {...}`** `check()` і навіть `downloadAndInstall()` відпрацьовують штатно — оновлення реально знаходиться й завантажується, — але виклик `$q.dialog(...)` кидає `TypeError: e.dialog is not a function`. Ця помилка ловиться тим самим catch, що й мережеві — йде в `console.error`, і користувач не бачить **нічого**: ні діалогу пропозиції оновитись, ні діалогу "перезапустити зараз". На відміну від відсутнього permission (де хоча б check() явно падає з помилкою), тут увесь конвеєр до install() працює — тому цей режим відмови важче запідозрити з логів CI/білда. Перевіряй `plugins: { Dialog }` поруч із перевіркою `updater:default` — обидва ламають однаково: мовчки.
+
+## VS Code розширення для Tauri-проєктів
+
+Rego-пакет: `tauri.vscode_extensions`
+
+Цільовий файл: `.vscode/extensions.json`
+
+Перевіряє, що поле `recommendations` містить розширення `tauri-apps.tauri-vscode`.
+
+Запускається умовно — лише якщо JS-перевірка (`tooling.mjs`) виявила маркер Tauri-проєкту (`src-tauri/`, `tauri.conf.json` або залежність `@tauri-apps/*`). Розширення `rust-lang.rust-analyzer` і `tamasfe.even-better-toml` вимагаються окремо правилом `rust` (rust.mdc).
+
+**✓ Правильно:**
+
+```json
+{ "recommendations": ["tauri-apps.tauri-vscode"] }
+```
+
+**✗ Неправильно:**
+
+```json
+{ "recommendations": ["rust-lang.rust-analyzer"] }
+{ "recommendations": [] }
+{}
+```

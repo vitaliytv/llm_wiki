@@ -48,3 +48,12 @@ pnpm-debug.log*
 # Brainstorm assets (not tracked in source control)
 .superpowers/
 .claude/
+# @7n/rules (adr) — локальні артефакти Stop-hook, не коміти
+*.secret
+.claude/hooks/*.log
+.claude/hooks/.normalize-state
+.claude/hooks/.normalize.lock
+.claude/scheduled_tasks.lock
+
+# @7n/rules — локальні git-worktree, не коміти
+.worktrees/

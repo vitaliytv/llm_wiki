@@ -54,6 +54,10 @@
     "zustand": "^5.0.12"
   },
   "devDependencies": {
+    "@7n/rules": "^1.28.1",
+    "@7n/rules-ci-github": "^1.7.1",
+    "@7n/rules-lang-js": "^0.4.1",
+    "@7n/rules-lang-rust": "^0.5.1",
     "@tauri-apps/cli": "^2.10.1",
     "@types/node": "^25.5.2",
     "@types/react": "^19.0.0",
