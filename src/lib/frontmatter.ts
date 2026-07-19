@@ -1,4 +1,4 @@
-import yaml from "js-yaml"
+import { JSON_SCHEMA, load as yamlLoad } from "js-yaml"
 
 export type FrontmatterValue = string | string[]
 
@@ -48,10 +48,10 @@ export function parseFrontmatter(content: string): FrontmatterParseResult {
   // beyond that is reported as no-frontmatter.
   let parsed: unknown
   try {
-    parsed = yaml.load(yamlPayload, { schema: yaml.JSON_SCHEMA })
+    parsed = yamlLoad(yamlPayload, { schema: JSON_SCHEMA })
   } catch {
     try {
-      parsed = yaml.load(repairWikilinkLists(yamlPayload), { schema: yaml.JSON_SCHEMA })
+      parsed = yamlLoad(repairWikilinkLists(yamlPayload), { schema: JSON_SCHEMA })
     } catch {
       return { frontmatter: null, body, rawBlock }
     }
